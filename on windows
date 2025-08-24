@@ -1,0 +1,301 @@
+import os
+import sys
+import time
+import warnings
+import threading
+import speech_recognition as sr
+import cv2
+import torch
+import geocoder
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from twilio.rest import Client
+from datetime import datetime
+
+# -----------------------
+# Suppress warnings
+# -----------------------
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ===== USER SETTINGS =====
+# Audio Detection Settings
+MIC_INDEX = 0  # Working mic from your test
+TRIGGER_KEYWORDS = {"help", "save me", "save-me", "saveme", "hello"}
+ALERT_COOLDOWN_SECS = 60
+FALLBACK_LOCATION_TEXT = "Location unavailable. Please call immediately."
+
+# Twilio Configuration
+TWILIO_ACCOUNT_SID = "YOUR_ACCOUNT_SID"  # Replace with your Twilio Account SID
+TWILIO_AUTH_TOKEN = "YOUR_AUTH_TOKEN"    # Replace with your Twilio Auth Token
+TWILIO_FROM_NUMBER = "YOUR_TWILIO_NUMBER"  # Replace with your Twilio phone number
+SEND_TO_NUMBER = "YOUR_PHONE_NUMBER"     # Replace with destination phone number
+
+# Visual Detection Settings
+STALKER_THRESHOLD_SECONDS = 60  # Alert if person stays for more than 1 minute
+WEBCAM_INDEX = 0
+# =========================
+
+# Initialize Twilio client
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Global variables for coordination
+last_audio_alert_time = 0
+alert_sent_ids = set()
+seen_times = {}
+system_running = True
+
+def send_sms(body: str, alert_type: str = "GENERAL"):
+    """Send SMS alert with specified body"""
+    try:
+        message = client.messages.create(
+            body=body,
+            from_=TWILIO_FROM_NUMBER,
+            to=SEND_TO_NUMBER
+        )
+        print(f"[{alert_type}] SMS sent. SID: {message.sid}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to send SMS: {e}")
+        return False
+
+def get_location():
+    """Get current location using IP geolocation"""
+    try:
+        g = geocoder.ip("me")
+        if g.ok and g.latlng:
+            lat, lon = g.latlng
+            return lat, lon
+    except Exception as e:
+        print(f"[ERROR] Location detection failed: {e}")
+    return None
+
+def format_audio_alert_message(lat=None, lon=None):
+    """Format message for audio trigger alerts"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    if lat and lon:
+        maps_link = f"https://maps.google.com/?q={lat},{lon}"
+        return f"🔊 AUDIO ALERT: Trigger word detected!\nTime: {timestamp}\n" \
+               f"Location: {lat:.6f}, {lon:.6f}\n{maps_link}"
+    else:
+        return f"🔊 AUDIO ALERT: Trigger word detected!\n{FALLBACK_LOCATION_TEXT}\nTime: {timestamp}"
+
+def format_visual_alert_message(person_id):
+    """Format message for visual stalker alerts"""
+    g = geocoder.ip('me')
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    if g.latlng:
+        location_url = f"https://www.google.com/maps?q={g.latlng[0]},{g.latlng[1]}"
+        location_text = f"Location: {location_url}"
+    else:
+        location_text = "Location not available"
+    
+    return f"👁️ VISUAL ALERT: Person (ID:{person_id}) followed you for over {STALKER_THRESHOLD_SECONDS} seconds!\n" \
+           f"Time: {timestamp}\n{location_text}"
+
+def normalize_text(text: str):
+    """Normalize text for keyword matching"""
+    return text.lower().strip()
+
+def contains_trigger(text: str):
+    """Check if text contains any trigger keywords"""
+    normalized = normalize_text(text)
+    return any(keyword in normalized for keyword in TRIGGER_KEYWORDS)
+
+def audio_detection_thread():
+    """Thread function for continuous audio monitoring"""
+    global last_audio_alert_time, system_running
+    
+    print("[AUDIO] Initializing speech recognition...")
+    r = sr.Recognizer()
+    
+    try:
+        mic = sr.Microphone(device_index=MIC_INDEX)
+        print(f"[AUDIO] Using microphone index {MIC_INDEX}")
+        
+        with mic as source:
+            print("[AUDIO] Adjusting for ambient noise... stay quiet.")
+            r.adjust_for_ambient_noise(source, duration=2)
+        
+        print("[AUDIO] Audio detection started. Listening for trigger words...")
+        
+        while system_running:
+            try:
+                with mic as source:
+                    audio = r.listen(source, timeout=5, phrase_time_limit=4)
+                
+                text = r.recognize_google(audio)
+                print(f"[AUDIO] Heard: {text}")
+                
+                if contains_trigger(text):
+                    current_time = time.time()
+                    if current_time - last_audio_alert_time >= ALERT_COOLDOWN_SECS:
+                        print("[AUDIO] Trigger word detected! Sending alert...")
+                        
+                        # Get location and send alert
+                        location = get_location()
+                        if location:
+                            lat, lon = location
+                            message = format_audio_alert_message(lat, lon)
+                        else:
+                            message = format_audio_alert_message()
+                        
+                        if send_sms(message, "AUDIO ALERT"):
+                            last_audio_alert_time = current_time
+                    else:
+                        print("[AUDIO] Alert cooldown active.")
+                        
+            except sr.UnknownValueError:
+                pass  # Could not understand audio - this is normal
+            except sr.RequestError as e:
+                print(f"[AUDIO] Google Speech Recognition error: {e}")
+            except Exception as e:
+                print(f"[AUDIO] Unexpected error: {e}")
+            
+            time.sleep(0.2)
+            
+    except Exception as e:
+        print(f"[AUDIO] Failed to initialize microphone: {e}")
+        print("[AUDIO] Audio detection disabled.")
+
+def visual_detection_main():
+    """Main function for visual stalker detection"""
+    global seen_times, alert_sent_ids, system_running
+    
+    print("[VISUAL] Loading YOLOv5 model...")
+    try:
+        model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+        model.conf = 0.5  # Confidence threshold
+        model.classes = [0]  # Only detect 'person'
+    except Exception as e:
+        print(f"[VISUAL] Failed to load YOLOv5 model: {e}")
+        return
+    
+    print("[VISUAL] Initializing DeepSORT tracker...")
+    tracker = DeepSort(max_age=30)
+    
+    print("[VISUAL] Starting webcam...")
+    cap = cv2.VideoCapture(WEBCAM_INDEX)
+    
+    if not cap.isOpened():
+        print(f"[VISUAL] ERROR: Could not open webcam at index {WEBCAM_INDEX}")
+        return
+    
+    print("[VISUAL] Visual detection started. Press 'q' in video window to quit.")
+    
+    try:
+        while system_running:
+            ret, frame = cap.read()
+            if not ret:
+                print("[VISUAL] ERROR: Failed to grab frame.")
+                break
+            
+            # Run YOLOv5 detection
+            results = model(frame)
+            detections = results.xyxy[0]
+            
+            # Convert YOLO detections to DeepSORT format
+            person_detections = []
+            for *box, conf, cls in detections.tolist():
+                if int(cls) == 0:  # Only person class
+                    x1, y1, x2, y2 = box
+                    person_detections.append(([x1, y1, x2, y2], float(conf), "person"))
+            
+            # Update DeepSORT tracker
+            tracks = tracker.update_tracks(person_detections, frame=frame)
+            current_time = time.time()
+            
+            # Process each tracked person
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+                
+                track_id = track.track_id
+                ltrb = track.to_ltrb()
+                x1, y1, x2, y2 = map(int, ltrb)
+                
+                # Draw tracking box and ID
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                # Track how long each person has been visible
+                if track_id not in seen_times:
+                    seen_times[track_id] = current_time
+                    print(f"[VISUAL] New person detected - ID: {track_id}")
+                else:
+                    elapsed = current_time - seen_times[track_id]
+                    
+                    # Show elapsed time on video
+                    cv2.putText(frame, f"Time: {elapsed:.1f}s", (x1, y2 + 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    
+                    # Check if person has been present too long
+                    if elapsed > STALKER_THRESHOLD_SECONDS and track_id not in alert_sent_ids:
+                        print(f"[VISUAL] WARNING: Person ID {track_id} present for {elapsed:.1f} seconds!")
+                        
+                        message = format_visual_alert_message(track_id)
+                        if send_sms(message, "VISUAL ALERT"):
+                            alert_sent_ids.add(track_id)
+            
+            # Add system status to frame
+            cv2.putText(frame, "Emergency Detection System Active", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Tracked persons: {len([t for t in tracks if t.is_confirmed()])}", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            
+            # Show live feed
+            cv2.imshow("Emergency Detection System - Visual Feed", frame)
+            
+            # Check for quit command
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[VISUAL] Quit command received.")
+                break
+                
+    except KeyboardInterrupt:
+        print("[VISUAL] Interrupted by user.")
+    except Exception as e:
+        print(f"[VISUAL] Unexpected error: {e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("[VISUAL] Visual detection stopped.")
+
+def main():
+    """Main function to coordinate both detection systems"""
+    global system_running
+    
+    print("="*60)
+    print("     COMBINED EMERGENCY DETECTION SYSTEM")
+    print("="*60)
+    print("Audio Detection: Listening for trigger words")
+    print("Visual Detection: Monitoring for stalker behavior")
+    print("Press Ctrl+C to stop the system")
+    print("="*60)
+    
+    # Validate Twilio configuration
+    if (TWILIO_ACCOUNT_SID == "YOUR_ACCOUNT_SID" or 
+        TWILIO_AUTH_TOKEN == "YOUR_AUTH_TOKEN" or
+        TWILIO_FROM_NUMBER == "YOUR_TWILIO_NUMBER" or
+        SEND_TO_NUMBER == "YOUR_PHONE_NUMBER"):
+        print("[ERROR] Please configure your Twilio credentials in the script!")
+        return
+    
+    try:
+        # Start audio detection in a separate thread
+        audio_thread = threading.Thread(target=audio_detection_thread, daemon=True)
+        audio_thread.start()
+        
+        # Run visual detection in main thread
+        visual_detection_main()
+        
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Shutting down emergency detection system...")
+    except Exception as e:
+        print(f"[SYSTEM] Critical error: {e}")
+    finally:
+        system_running = False
+        print("[SYSTEM] Emergency detection system stopped.")
+
+if __name__ == "__main__":
+    main()
