@@ -1,0 +1,394 @@
+import os
+import sys
+import time
+import warnings
+import threading
+import speech_recognition as sr
+import cv2
+import numpy as np
+import geocoder
+from twilio.rest import Client
+from datetime import datetime
+
+# -----------------------
+# Suppress warnings
+# -----------------------
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ===== USER SETTINGS =====
+# Audio Detection Settings
+MIC_INDEX = 0  # USB microphone usually index 1 or 2 on RPi
+TRIGGER_KEYWORDS = {"help", "save me", "save-me", "saveme", "hello"}
+ALERT_COOLDOWN_SECS = 60
+FALLBACK_LOCATION_TEXT = "Location unavailable. Please call immediately."
+
+# Twilio Configuration
+TWILIO_ACCOUNT_SID = "YOUR_ACCOUNT_SID"
+TWILIO_AUTH_TOKEN = "YOUR_AUTH_TOKEN"
+TWILIO_FROM_NUMBER = "YOUR_TWILIO_NUMBER"
+SEND_TO_NUMBER = "YOUR_PHONE_NUMBER"
+
+# Visual Detection Settings - OPTIMIZED FOR RASPBERRY PI
+STALKER_THRESHOLD_SECONDS = 60
+WEBCAM_INDEX = 0
+FRAME_WIDTH = 320  # Reduced resolution for better performance
+FRAME_HEIGHT = 240
+FPS_TARGET = 10  # Lower FPS to reduce CPU load
+DETECTION_SKIP_FRAMES = 5  # Process every 5th frame only
+MIN_PERSON_AREA = 2000  # Minimum area to consider as person
+TRACKER_MAX_AGE = 50  # Increased for lower FPS
+# =========================
+
+# Initialize Twilio client
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Global variables for coordination
+last_audio_alert_time = 0
+alert_sent_ids = set()
+seen_times = {}
+system_running = True
+frame_count = 0
+
+# Simple tracker class since DeepSORT might be too heavy
+class SimpleTracker:
+    def __init__(self, max_age=50):
+        self.tracks = {}
+        self.next_id = 1
+        self.max_age = max_age
+        
+    def update(self, detections):
+        """Update tracks with new detections"""
+        current_time = time.time()
+        
+        # Age existing tracks
+        for track_id in list(self.tracks.keys()):
+            self.tracks[track_id]['age'] += 1
+            if self.tracks[track_id]['age'] > self.max_age:
+                del self.tracks[track_id]
+        
+        # Match detections to existing tracks (simple distance-based)
+        for detection in detections:
+            x, y, w, h = detection
+            center_x, center_y = x + w//2, y + h//2
+            
+            # Find closest existing track
+            min_distance = float('inf')
+            matched_track = None
+            
+            for track_id, track in self.tracks.items():
+                track_center_x = track['x'] + track['w']//2
+                track_center_y = track['y'] + track['h']//2
+                distance = np.sqrt((center_x - track_center_x)**2 + (center_y - track_center_y)**2)
+                
+                if distance < min_distance and distance < 100:  # Max matching distance
+                    min_distance = distance
+                    matched_track = track_id
+            
+            if matched_track:
+                # Update existing track
+                self.tracks[matched_track].update({
+                    'x': x, 'y': y, 'w': w, 'h': h,
+                    'age': 0,
+                    'last_seen': current_time
+                })
+            else:
+                # Create new track
+                self.tracks[self.next_id] = {
+                    'x': x, 'y': y, 'w': w, 'h': h,
+                    'age': 0,
+                    'first_seen': current_time,
+                    'last_seen': current_time,
+                    'id': self.next_id
+                }
+                self.next_id += 1
+        
+        return list(self.tracks.values())
+
+def send_sms(body: str, alert_type: str = "GENERAL"):
+    """Send SMS alert with specified body"""
+    try:
+        message = client.messages.create(
+            body=body,
+            from_=TWILIO_FROM_NUMBER,
+            to=SEND_TO_NUMBER
+        )
+        print(f"[{alert_type}] SMS sent. SID: {message.sid}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to send SMS: {e}")
+        return False
+
+def get_location():
+    """Get current location using IP geolocation"""
+    try:
+        g = geocoder.ip("me")
+        if g.ok and g.latlng:
+            lat, lon = g.latlng
+            return lat, lon
+    except Exception as e:
+        print(f"[ERROR] Location detection failed: {e}")
+    return None
+
+def format_audio_alert_message(lat=None, lon=None):
+    """Format message for audio trigger alerts"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    if lat and lon:
+        maps_link = f"https://maps.google.com/?q={lat},{lon}"
+        return f"🔊 AUDIO ALERT: Trigger word detected!\nTime: {timestamp}\n" \
+               f"Location: {lat:.6f}, {lon:.6f}\n{maps_link}"
+    else:
+        return f"🔊 AUDIO ALERT: Trigger word detected!\n{FALLBACK_LOCATION_TEXT}\nTime: {timestamp}"
+
+def format_visual_alert_message(person_id):
+    """Format message for visual stalker alerts"""
+    g = geocoder.ip('me')
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    if g.latlng:
+        location_url = f"https://www.google.com/maps?q={g.latlng[0]},{g.latlng[1]}"
+        location_text = f"Location: {location_url}"
+    else:
+        location_text = "Location not available"
+    
+    return f"👁️ VISUAL ALERT: Person (ID:{person_id}) present for over {STALKER_THRESHOLD_SECONDS} seconds!\n" \
+           f"Time: {timestamp}\n{location_text}"
+
+def normalize_text(text: str):
+    """Normalize text for keyword matching"""
+    return text.lower().strip()
+
+def contains_trigger(text: str):
+    """Check if text contains any trigger keywords"""
+    normalized = normalize_text(text)
+    return any(keyword in normalized for keyword in TRIGGER_KEYWORDS)
+
+def detect_persons_opencv(frame):
+    """Detect persons using OpenCV HOG detector (lighter than YOLO)"""
+    # Initialize HOG descriptor/person detector
+    hog = cv2.HOGDescriptorConfig()
+    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    
+    # Detect people
+    boxes, weights = hog.detectMultiScale(frame, winStride=(8,8), padding=(32,32), scale=1.05)
+    
+    # Filter detections by area
+    filtered_boxes = []
+    for (x, y, w, h) in boxes:
+        if w * h > MIN_PERSON_AREA:
+            filtered_boxes.append((x, y, w, h))
+    
+    return filtered_boxes
+
+def audio_detection_thread():
+    """Thread function for continuous audio monitoring"""
+    global last_audio_alert_time, system_running
+    
+    print("[AUDIO] Initializing speech recognition...")
+    r = sr.Recognizer()
+    
+    try:
+        # On RPi, you might need to specify the microphone device
+        try:
+            mic = sr.Microphone(device_index=MIC_INDEX)
+        except:
+            print(f"[AUDIO] Microphone index {MIC_INDEX} not found, using default")
+            mic = sr.Microphone()
+        
+        print(f"[AUDIO] Using microphone")
+        
+        with mic as source:
+            print("[AUDIO] Adjusting for ambient noise... stay quiet.")
+            r.adjust_for_ambient_noise(source, duration=2)
+        
+        print("[AUDIO] Audio detection started. Listening for trigger words...")
+        
+        while system_running:
+            try:
+                with mic as source:
+                    # Shorter timeout for RPi
+                    audio = r.listen(source, timeout=3, phrase_time_limit=3)
+                
+                text = r.recognize_google(audio)
+                print(f"[AUDIO] Heard: {text}")
+                
+                if contains_trigger(text):
+                    current_time = time.time()
+                    if current_time - last_audio_alert_time >= ALERT_COOLDOWN_SECS:
+                        print("[AUDIO] Trigger word detected! Sending alert...")
+                        
+                        # Get location and send alert
+                        location = get_location()
+                        if location:
+                            lat, lon = location
+                            message = format_audio_alert_message(lat, lon)
+                        else:
+                            message = format_audio_alert_message()
+                        
+                        if send_sms(message, "AUDIO ALERT"):
+                            last_audio_alert_time = current_time
+                    else:
+                        print("[AUDIO] Alert cooldown active.")
+                        
+            except sr.UnknownValueError:
+                pass  # Could not understand audio - this is normal
+            except sr.RequestError as e:
+                print(f"[AUDIO] Google Speech Recognition error: {e}")
+                time.sleep(5)  # Wait before retrying
+            except Exception as e:
+                print(f"[AUDIO] Unexpected error: {e}")
+            
+            time.sleep(0.5)  # Longer sleep for RPi
+            
+    except Exception as e:
+        print(f"[AUDIO] Failed to initialize microphone: {e}")
+        print("[AUDIO] Audio detection disabled.")
+
+def visual_detection_main():
+    """Main function for visual detection using OpenCV HOG"""
+    global seen_times, alert_sent_ids, system_running, frame_count
+    
+    print("[VISUAL] Initializing OpenCV HOG person detector...")
+    tracker = SimpleTracker(max_age=TRACKER_MAX_AGE)
+    
+    print("[VISUAL] Starting camera...")
+    cap = cv2.VideoCapture(WEBCAM_INDEX)
+    
+    if not cap.isOpened():
+        print(f"[VISUAL] ERROR: Could not open camera at index {WEBCAM_INDEX}")
+        return
+    
+    # Set camera properties for better RPi performance
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+    
+    # Initialize HOG detector
+    hog = cv2.HOGDescriptor()
+    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    
+    print("[VISUAL] Visual detection started. Press 'q' to quit.")
+    print(f"[VISUAL] Running at {FRAME_WIDTH}x{FRAME_HEIGHT} resolution")
+    
+    try:
+        while system_running:
+            ret, frame = cap.read()
+            if not ret:
+                print("[VISUAL] ERROR: Failed to grab frame.")
+                break
+            
+            frame_count += 1
+            current_time = time.time()
+            
+            # Only process every Nth frame to save CPU
+            if frame_count % DETECTION_SKIP_FRAMES == 0:
+                # Convert to grayscale for faster processing
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # Detect people using HOG
+                boxes, weights = hog.detectMultiScale(
+                    gray,
+                    winStride=(8, 8),
+                    padding=(32, 32),
+                    scale=1.05,
+                    finalThreshold=2
+                )
+                
+                # Filter by area and convert format
+                detections = []
+                for (x, y, w, h) in boxes:
+                    if w * h > MIN_PERSON_AREA:
+                        detections.append((x, y, w, h))
+                
+                # Update tracker
+                tracks = tracker.update(detections)
+                
+                # Process tracked persons
+                for track in tracks:
+                    track_id = track['id']
+                    x, y, w, h = track['x'], track['y'], track['w'], track['h']
+                    
+                    # Draw bounding box
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(frame, f"ID: {track_id}", (x, y - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    # Calculate time present
+                    if track_id not in seen_times:
+                        seen_times[track_id] = track['first_seen']
+                        print(f"[VISUAL] New person detected - ID: {track_id}")
+                    
+                    elapsed = current_time - seen_times[track_id]
+                    
+                    # Show elapsed time
+                    cv2.putText(frame, f"Time: {elapsed:.1f}s", (x, y + h + 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    
+                    # Check for stalker behavior
+                    if elapsed > STALKER_THRESHOLD_SECONDS and track_id not in alert_sent_ids:
+                        print(f"[VISUAL] WARNING: Person ID {track_id} present for {elapsed:.1f} seconds!")
+                        
+                        message = format_visual_alert_message(track_id)
+                        if send_sms(message, "VISUAL ALERT"):
+                            alert_sent_ids.add(track_id)
+            
+            # Add system status (smaller text for RPi)
+            cv2.putText(frame, "RPi Emergency System", (10, 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(frame, f"Frame: {frame_count}", (10, 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # Show frame (optional - can be disabled for headless operation)
+            try:
+                cv2.imshow("RPi Emergency Detection", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            except:
+                # Headless mode - no display available
+                pass
+                
+    except KeyboardInterrupt:
+        print("[VISUAL] Interrupted by user.")
+    except Exception as e:
+        print(f"[VISUAL] Unexpected error: {e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("[VISUAL] Visual detection stopped.")
+
+def main():
+    """Main function optimized for Raspberry Pi"""
+    global system_running
+    
+    print("="*50)
+    print("  RASPBERRY PI 4 EMERGENCY DETECTION")
+    print("="*50)
+    print("Audio: Listening for trigger words")
+    print("Visual: HOG person detection")
+    print("Press Ctrl+C to stop")
+    print("="*50)
+    
+    # Validate Twilio configuration
+    if (TWILIO_ACCOUNT_SID == "YOUR_ACCOUNT_SID" or 
+        TWILIO_AUTH_TOKEN == "YOUR_AUTH_TOKEN"):
+        print("[ERROR] Please configure Twilio credentials!")
+        return
+    
+    try:
+        # Start audio detection thread
+        audio_thread = threading.Thread(target=audio_detection_thread, daemon=True)
+        audio_thread.start()
+        
+        # Run visual detection in main thread
+        visual_detection_main()
+        
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Shutting down...")
+    except Exception as e:
+        print(f"[SYSTEM] Critical error: {e}")
+    finally:
+        system_running = False
+        print("[SYSTEM] Emergency detection stopped.")
+
+if __name__ == "__main__":
+    main()
