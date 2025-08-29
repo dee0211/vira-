@@ -1,225 +1,201 @@
+#!/usr/bin/env python3
 import os
 import sys
 import time
 import warnings
-import threading
-import speech_recognition as sr
 import cv2
 import torch
-import numpy as np
 import geocoder
+import subprocess
+import numpy as np
+import speech_recognition as sr
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from twilio.rest import Client
 from datetime import datetime
-import subprocess
-from ultralytics import YOLO  # ✅ ultralytics for YOLOv5n
 
 # -----------------------
-# Suppress warnings
+# Config
 # -----------------------
-warnings.filterwarnings("ignore", category=FutureWarning)
-os.environ['YOLO_VERBOSE'] = 'False'
-
-# ===== USER SETTINGS =====
-# Audio Detection Settings
-MIC_INDEX = 3  # ✅ your mic is on port 3
+CAPTURE_PATH = "capture.jpg"
+ANNOTATED_PATH = "yolo_annotated.jpg"
+WIDTH, HEIGHT = 640, 480
+TWILIO_ACCOUNT_SID = "YOUR_ACCT_SID"
+TWILIO_AUTH_TOKEN = "YOUR_AUTH_TOKEN"
+TWILIO_FROM_NUMBER = "YOUR_TWILIO_NUMBER"
+SEND_TO_NUMBER = "YOUR_NUMBER"
+MIC_INDEX = 0
 TRIGGER_KEYWORDS = {"help", "save me", "save-me", "saveme", "hello"}
 ALERT_COOLDOWN_SECS = 60
 FALLBACK_LOCATION_TEXT = "Location unavailable. Please call immediately."
+CAPTURE_INTERVAL = 10  # seconds
+ALERT_THRESHOLD = 60  # seconds to trigger alert if ID is present
+# -----------------------
 
-# Twilio Configuration
-TWILIO_ACCOUNT_SID = "AC627af4eb75d3b12614d48a294026102f"
-TWILIO_AUTH_TOKEN = "323046ee8236ea7fc338b70c0632532c"
-TWILIO_FROM_NUMBER = "+17753645311"
-SEND_TO_NUMBER = "+917411125377"
-
-# Visual Detection Settings
-STALKER_THRESHOLD_SECONDS = 60
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
-FPS_TARGET = 5
-DETECTION_SKIP_FRAMES = 2
-YOLO_CONFIDENCE = 0.35
-YOLO_IOU_THRESHOLD = 0.5
-MIN_PERSON_AREA = 2000
-DEEPSORT_MAX_AGE = 50
-USE_GPU = False
-# =========================
-
-# Initialize Twilio client
+warnings.filterwarnings("ignore", category=FutureWarning)
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# Global variables
-last_audio_alert_time = 0
-alert_sent_ids = set()
-seen_times = {}
-system_running = True
-frame_count = 0
-yolo_model = None
-deepsort_tracker = None
-
-def load_yolo_model():
-    """Load YOLOv5 Nano model optimized for Raspberry Pi"""
-    global yolo_model
-
-    print("[YOLO] Loading YOLOv5 Nano model (Ultralytics)...")
-
+def send_sms(body: str):
     try:
-        # Force CPU usage unless GPU is specifically enabled
-        device = 'cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
-        print(f"[YOLO] Using device: {device}")
-
-        # ✅ This downloads yolov5n.pt the first time
-        yolo_model = YOLO("yolov5n.pt")
-
-        print("[YOLO] YOLOv5 Nano model loaded successfully")
-        return True
-
-    except Exception as e:
-        print(f"[YOLO] Failed to load YOLOv5 model: {e}")
-        print("[YOLO] Make sure you have internet connection for first-time download")
-        return False
-
-def initialize_deepsort():
-    """Initialize DeepSORT tracker with optimized settings for RPi"""
-    global deepsort_tracker
-    print("[DEEPSORT] Initializing DeepSORT tracker...")
-
-    try:
-        deepsort_tracker = DeepSort(
-            max_age=DEEPSORT_MAX_AGE,
-            n_init=3,
-            nms_max_overlap=1.0,
-            max_cosine_distance=0.4,
-            embedder="mobilenet",
-            half=False,
-            bgr=True,
-            embedder_gpu=USE_GPU
+        message = client.messages.create(
+            body=body,
+            from_=TWILIO_FROM_NUMBER,
+            to=SEND_TO_NUMBER
         )
-        print("[DEEPSORT] DeepSORT tracker initialized successfully")
-        return True
-
+        print(f"[SMS SENT] SID: {message.sid}")
     except Exception as e:
-        print(f"[DEEPSORT] Failed to initialize DeepSORT: {e}")
-        return False
+        print("[ERROR] Failed to send SMS:", e)
 
-def visual_detection_main():
-    """Main function for visual detection using YOLOv5 + DeepSORT + rpicam-apps"""
-    global seen_times, alert_sent_ids, system_running, frame_count, yolo_model, deepsort_tracker
-
-    if not load_yolo_model():
-        print("[VISUAL] Cannot start visual detection without YOLO model")
-        return
-
-    if not initialize_deepsort():
-        print("[VISUAL] Cannot start visual detection without DeepSORT")
-        return
-
-    print("[VISUAL] Starting rpicam-vid subprocess...")
-
-    # ✅ Launch rpicam-vid to stream frames to stdout
-    cam_process = subprocess.Popen(
-        ["rpicam-vid", "--inline", "--timeout", "0", "--width", str(FRAME_WIDTH),
-         "--height", str(FRAME_HEIGHT), "--framerate", str(FPS_TARGET), "-o", "-"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
-
-    bytes_buffer = b""
-
+def get_location():
     try:
-        while system_running:
-            # Read raw stream from rpicam-vid
-            data = cam_process.stdout.read(1024)
-            if not data:
+        g = geocoder.ip("me")
+        if g.ok and g.latlng:
+            return g.latlng
+    except:
+        pass
+    return None
+
+def format_location_message(lat, lon, extra=""):
+    maps_link = f"https://maps.google.com/?q={lat},{lon}"
+    return f"ALERT: {extra}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
+           f"Location: {lat:.6f}, {lon:.6f}\n{maps_link}"
+
+def format_fallback_message(extra=""):
+    return f"ALERT: {extra}\n{FALLBACK_LOCATION_TEXT}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+def normalize_text(t: str):
+    return t.lower().strip()
+
+def contains_trigger(text: str):
+    t = normalize_text(text)
+    return any(k in t for k in TRIGGER_KEYWORDS)
+
+# -----------------------
+# Load YOLOv5
+# -----------------------
+print("[INFO] Loading YOLOv5 model...")
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+model.conf = 0.5  # confidence threshold
+model.classes = [0]  # only detect person
+
+# -----------------------
+# Initialize DeepSORT
+# -----------------------
+tracker = DeepSort(max_age=30)
+seen_times = {}       # track when each ID was first seen
+alert_sent_ids = set()
+
+# -----------------------
+# Initialize Speech Recognizer
+# -----------------------
+r = sr.Recognizer()
+mic = sr.Microphone(device_index=MIC_INDEX)
+last_alert_time = 0
+
+print("[INFO] Starting stalker detection loop... Press Ctrl+C to stop.")
+while True:
+    loop_start = time.time()
+
+    # --- Capture image ---
+    capture_cmds = [
+        ["libcamera-still", "-o", CAPTURE_PATH, "-n", "--width", str(WIDTH), "--height", str(HEIGHT), "-t", "1500"],
+        ["rpicam-still", "-o", CAPTURE_PATH, "-t", "1500"]
+    ]
+    captured = False
+    for cmd in capture_cmds:
+        try:
+            subprocess.run(cmd, check=True)
+            time.sleep(0.2)
+            if os.path.exists(CAPTURE_PATH):
+                captured = True
                 break
-            bytes_buffer += data
+        except:
+            continue
 
-            # Try decoding frame
-            a = bytes_buffer.find(b'\xff\xd8')
-            b = bytes_buffer.find(b'\xff\xd9')
+    if not captured:
+        print("[ERROR] Could not capture image. Skipping this cycle.")
+        time.sleep(CAPTURE_INTERVAL)
+        continue
 
-            if a != -1 and b != -1:
-                jpg = bytes_buffer[a:b+2]
-                bytes_buffer = bytes_buffer[b+2:]
-                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    img = cv2.imread(CAPTURE_PATH)
+    if img is None:
+        print("[ERROR] Failed to read captured image. Skipping this cycle.")
+        time.sleep(CAPTURE_INTERVAL)
+        continue
 
-                if frame is None:
-                    continue
+    # --- YOLO inference ---
+    results = model(img)
+    detections = results.xyxy[0]
 
-                frame_count += 1
-                if frame_count % DETECTION_SKIP_FRAMES != 0:
-                    continue
+    # --- Prepare detections for DeepSORT ---
+    person_dets = []
+    for *box, conf, cls in detections.tolist():
+        if int(cls) == 0:
+            x1, y1, x2, y2 = box
+            person_dets.append(([x1, y1, x2, y2], float(conf), "person"))
 
-                # Run YOLO inference
-                results = yolo_model(frame, verbose=False)
-                detections = []
-                for r in results:
-                    for box in r.boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        conf = box.conf[0].cpu().item()
-                        cls = int(box.cls[0].cpu().item())
-                        detections.append([x1, y1, x2, y2, conf, cls])
+    tracks = tracker.update_tracks(person_dets, frame=img)
+    current_time = time.time()
 
-                # Convert to DeepSORT format
-                deepsort_detections = []
-                for det in detections:
-                    x1, y1, x2, y2, conf, cls = det
-                    if cls != 0:  # only person
-                        continue
-                    area = (x2 - x1) * (y2 - y1)
-                    if area < MIN_PERSON_AREA:
-                        continue
-                    bbox = [float(x1), float(y1), float(x2), float(y2)]
-                    deepsort_detections.append((bbox, float(conf), "person"))
+    # --- Process tracked people ---
+    for track in tracks:
+        if not track.is_confirmed():
+            continue
+        track_id = track.track_id
+        x1, y1, x2, y2 = map(int, track.to_ltrb())
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(img, f"ID: {track_id}", (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0),2)
 
-                # Track with DeepSORT
-                tracks = deepsort_tracker.update_tracks(deepsort_detections, frame=frame)
+        # Track time seen
+        if track_id not in seen_times:
+            seen_times[track_id] = current_time
+        else:
+            elapsed = current_time - seen_times[track_id]
+            if elapsed > ALERT_THRESHOLD and track_id not in alert_sent_ids:
+                loc = get_location()
+                if loc:
+                    lat, lon = loc
+                    msg = format_location_message(lat, lon, extra=f"Person ID {track_id} detected >{ALERT_THRESHOLD} sec")
+                else:
+                    msg = format_fallback_message(extra=f"Person ID {track_id} detected >{ALERT_THRESHOLD} sec")
+                send_sms(msg)
+                alert_sent_ids.add(track_id)
 
-                # Draw results
-                for track in tracks:
-                    if track.is_confirmed():
-                        x1, y1, x2, y2 = map(int, track.to_ltrb())
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, f"ID {track.track_id}", (x1, y1 - 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                # Show frame
-                try:
-                    cv2.imshow("RPi YOLOv5 + DeepSORT", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                except:
-                    pass
-
-    except KeyboardInterrupt:
-        print("[VISUAL] Interrupted by user.")
-    finally:
-        cam_process.terminate()
-        cv2.destroyAllWindows()
-        print("[VISUAL] Visual detection stopped.")
-
-def main():
-    """Main function optimized for Raspberry Pi with YOLOv5 + DeepSORT"""
-    global system_running
-
-    print("="*65)
-    print("  RASPBERRY PI 4 EMERGENCY DETECTION WITH YOLOv5 + DeepSORT")
-    print("="*65)
-
+    # --- Save annotated image ---
     try:
-        # Start audio detection thread
-        audio_thread = threading.Thread(target=audio_detection_thread, daemon=True)
-        audio_thread.start()
+        annotated = results.render()[0]
+        cv2.imwrite(ANNOTATED_PATH, annotated)
+    except:
+        cv2.imwrite(ANNOTATED_PATH, img)
 
-        # Run visual detection
-        visual_detection_main()
+    # --- Speech recognition ---
+    with mic as source:
+        r.adjust_for_ambient_noise(source, duration=0.5)
+        try:
+            audio = r.listen(source, timeout=3, phrase_time_limit=3)
+            text = r.recognize_google(audio)
+            print(f"Heard: {text}")
+            if contains_trigger(text):
+                now = time.time()
+                if now - last_alert_time >= ALERT_COOLDOWN_SECS:
+                    loc = get_location()
+                    if loc:
+                        lat, lon = loc
+                        msg = format_location_message(lat, lon, extra="Voice trigger detected!")
+                    else:
+                        msg = format_fallback_message(extra="Voice trigger detected!")
+                    send_sms(msg)
+                    last_alert_time = now
+                else:
+                    print("Alert cooldown active.")
+        except sr.UnknownValueError:
+            pass
+        except sr.RequestError as e:
+            print("Speech recognition error:", e)
+        except Exception as e:
+            print("Mic error:", e)
 
-    except KeyboardInterrupt:
-        print("\n[SYSTEM] Shutting down...")
-    finally:
-        system_running = False
-        print("[SYSTEM] Emergency detection stopped.")
-
-if __name__ == "__main__":
-    main()
+    # --- Wait for next cycle ---
+    elapsed = time.time() - loop_start
+    sleep_time = max(0, CAPTURE_INTERVAL - elapsed)
+    time.sleep(sleep_time)
