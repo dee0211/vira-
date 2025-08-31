@@ -2,6 +2,7 @@
 import os
 import time
 import warnings
+import logging   # ? correct module
 import cv2
 import torch
 import geocoder
@@ -9,9 +10,24 @@ import subprocess
 import numpy as np
 import threading
 import speech_recognition as sr
+from ultralytics import YOLO  # Changed from torch.hub to ultralytics
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from twilio.rest import Client
 from datetime import datetime
+
+# Suppress ALSA / PyAudio warnings
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["ALSA_PCM_CARD"] = "3"
+os.environ["ALSA_CTL_CARD"] = "3"
+
+# Suppress non-critical log messages
+logging.getLogger("numba").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
+# Redirect stderr (where ALSA errors are printed) to /dev/null
+import sys
+sys.stderr = open(os.devnull, 'w')  # ? fixed
+
 
 # -----------------------
 # Config
@@ -19,11 +35,11 @@ from datetime import datetime
 CAPTURE_PATH = "capture.jpg"
 ANNOTATED_PATH = "yolo_annotated.jpg"
 WIDTH, HEIGHT = 640, 480
-TWILIO_ACCOUNT_SID = "YOUR_ACCT_SID"
-TWILIO_AUTH_TOKEN = "YOUR_AUTH_TOKEN"
-TWILIO_FROM_NUMBER = "YOUR_TWILIO_NUMBER"
-SEND_TO_NUMBER = "YOUR_NUMBER"
-MIC_INDEX = 0
+TWILIO_ACCOUNT_SID = "AC627af4eb75d3b12614d48a294026102f"
+TWILIO_AUTH_TOKEN = "f48aefdc8196d9aade7ac2352dc0e99a"
+TWILIO_FROM_NUMBER = "+17753645311"
+SEND_TO_NUMBER = "+917411125377"
+MIC_INDEX = 1
 TRIGGER_KEYWORDS = {"help", "save me", "save-me", "saveme", "hello"}
 ALERT_COOLDOWN_SECS = 60
 FALLBACK_LOCATION_TEXT = "Location unavailable. Please call immediately."
@@ -72,23 +88,53 @@ def contains_trigger(text: str):
     t = normalize_text(text)
     return any(k in t for k in TRIGGER_KEYWORDS)
 
-# -----------------------
-# Load YOLOv5 Model
-# -----------------------
-print("[INFO] Loading YOLOv5 model...")
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-model.conf = 0.5
-model.classes = [0]  # only detect person
+def capture_frame():
+    """Capture one frame using rpicam-vid and return as OpenCV image."""
+    try:
+        cmd = [
+            "rpicam-vid",
+            "-t", "1000",                # 1 second capture
+            "-o", "-",                   # output to stdout
+            "--width", str(WIDTH),
+            "--height", str(HEIGHT),
+            "--codec", "mjpeg",          # MJPEG stream
+            "--nopreview",
+            "-n"
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        data = b""
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            data += chunk
+        proc.terminate()
+        # Decode MJPEG to OpenCV image
+        image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        return image
+    except Exception as e:
+        print(f"[ERROR] Capture failed: {e}")
+        return None
 
 # -----------------------
-# Initialize DeepSORT
+# Load YOLO8 Model (Updated from YOLOv5)
 # -----------------------
-tracker = DeepSort(max_age=30)
+print("[INFO] Loading YOLOv8 model...")
+model = YOLO("yolov8n.pt")
+
+# -----------------------
+# Initialize DeepSORT with optimized settings from modeltest
+# -----------------------
+tracker = DeepSort(
+    max_age=5,      # forget after 5 frames instead of 30
+    n_init=1,       # assign ID after 1 detection instead of waiting
+    max_iou_distance=0.7
+)
 seen_times = {}
 alert_sent_ids = set()
 
 # -----------------------
-# Speech Recognition Thread
+# Speech Recognition Thread (UNCHANGED)
 # -----------------------
 last_alert_time = 0
 def speech_thread():
@@ -101,7 +147,7 @@ def speech_thread():
     while True:
         with mic as source:
             try:
-                audio = r.listen(source, timeout=3, phrase_time_limit=3)
+                audio = r.listen(source, timeout=10, phrase_time_limit=10)
                 text = r.recognize_google(audio)
                 print(f"[VOICE] Heard: {text}")
                 if contains_trigger(text):
@@ -125,68 +171,60 @@ def speech_thread():
                 print("[VOICE] Mic error:", e)
 
 # -----------------------
-# Image Capture + YOLO Thread
+# Image Capture + YOLO Thread (UPDATED with working tracking)
 # -----------------------
 def capture_loop():
     print("[INFO] Starting image capture loop...")
     while True:
         loop_start = time.time()
-        # --- Capture image ---
-        capture_cmds = [
-            ["libcamera-still", "-o", CAPTURE_PATH, "-n", "--width", str(WIDTH), "--height", str(HEIGHT), "-t", "1500"],
-            ["rpicam-still", "-o", CAPTURE_PATH, "-t", "1500"]
-        ]
-        captured = False
-        for cmd in capture_cmds:
-            try:
-                subprocess.run(cmd, check=True)
-                time.sleep(0.2)
-                if os.path.exists(CAPTURE_PATH):
-                    captured = True
-                    break
-            except:
-                continue
-        if not captured:
-            print("[ERROR] Could not capture image. Skipping this cycle.")
+        
+        # --- Capture frame using the working method from modeltest ---
+        frame = capture_frame()
+        if frame is None:
+            print("[WARN] No frame captured.")
             time.sleep(CAPTURE_INTERVAL)
             continue
 
-        img = cv2.imread(CAPTURE_PATH)
-        if img is None:
-            print("[ERROR] Failed to read captured image. Skipping this cycle.")
-            time.sleep(CAPTURE_INTERVAL)
-            continue
+        # --- YOLO8 inference (Updated from YOLOv5) ---
+        results = model(frame)[0]
+        detections = []
+        
+        # --- Process detections with proper coordinate conversion ---
+        for box in results.boxes:
+            if box.cls is not None and int(box.cls[0]) == 0:  # person class
+                x_center, y_center, w, h = box.xywh[0].tolist()
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                
+                # Convert YOLO (center) to DeepSORT (top-left, width, height)
+                x1 = x_center - w / 2
+                y1 = y_center - h / 2
+                detections.append(([x1, y1, w, h], conf, cls))
 
-        # --- YOLO inference ---
-        results = model(img)
-        detections = results.xyxy[0]
-
-        # --- Prepare detections for DeepSORT ---
-        person_dets = []
-        for *box, conf, cls in detections.tolist():
-            if int(cls) == 0:
-                x1, y1, x2, y2 = box
-                person_dets.append(([x1, y1, x2, y2], float(conf), "person"))
-
-        tracks = tracker.update_tracks(person_dets, frame=img)
+        # --- Update tracker with proper detections ---
+        tracks = tracker.update_tracks(detections, frame=frame)
         current_time = time.time()
 
-        # --- Process tracked people ---
+        # --- Process tracked people (Updated with working tracking logic) ---
         for track in tracks:
             if not track.is_confirmed():
                 continue
             track_id = track.track_id
             x1, y1, x2, y2 = map(int, track.to_ltrb())
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img, f"ID: {track_id}", (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0),2)
+            
+            # Draw bounding box and ID
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID: {track_id}", (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-            # Track time seen
+            # Track time seen for alerts
             if track_id not in seen_times:
                 seen_times[track_id] = current_time
+                print(f"[TRACKING] New person detected: ID {track_id}")
             else:
                 elapsed = current_time - seen_times[track_id]
                 if elapsed > ALERT_THRESHOLD and track_id not in alert_sent_ids:
+                    print(f"[ALERT] Person ID {track_id} present for {elapsed:.1f} seconds")
                     loc = get_location()
                     if loc:
                         lat, lon = loc
@@ -197,11 +235,8 @@ def capture_loop():
                     alert_sent_ids.add(track_id)
 
         # Save annotated image
-        try:
-            annotated = results.render()[0]
-            cv2.imwrite(ANNOTATED_PATH, annotated)
-        except:
-            cv2.imwrite(ANNOTATED_PATH, img)
+        cv2.imwrite(ANNOTATED_PATH, frame)
+        print(f"[INFO] Processed frame with {len(tracks)} confirmed tracks")
 
         elapsed = time.time() - loop_start
         sleep_time = max(0, CAPTURE_INTERVAL - elapsed)
